@@ -42,7 +42,7 @@ class ScrapingConfig(BaseModel):
     # Timing
     request_delay: float = Field(default=0.5, ge=0.1, description="Delay between requests")
     page_load_delay: int = Field(default=1, ge=0, description="Page load wait time")
-    retry_delay: int = Field(default=300, ge=60, description="Retry delay (seconds)")
+    retry_delay: int = Field(default=1000, ge=60, description="Retry delay (seconds)")
     max_retries: int = Field(default=5, ge=1, description="Max retry attempts")
     
     # Browser
@@ -206,6 +206,49 @@ class Cache:
         logging.info("Creating new cache")
         return {'urls': [], 'project_ids': [], 'failed_urls': []}
     
+    def rebuild_from_existing_projects(self) -> None:
+        """Rebuild cache by scanning output directory for existing projects."""
+        try:
+            from pathlib import Path
+            output_path = Path(self.config.output_dir)
+            
+            if not output_path.exists():
+                logging.info("Output directory doesn't exist, skipping rebuild")
+                return
+            
+            logging.info(f"Rebuilding cache from existing projects in {output_path}")
+            
+            # Scan for existing project folders
+            for project_dir in output_path.iterdir():
+                if not project_dir.is_dir():
+                    continue
+                
+                metadata_file = project_dir / "metadata.json"
+                if metadata_file.exists():
+                    try:
+                        metadata = read_json(str(metadata_file))
+                        if metadata:
+                            url = metadata.get('url')
+                            project_id = metadata.get('project_id')
+                            
+                            if url and url not in self.data['urls']:
+                                self.data['urls'].append(url)
+                                logging.debug(f"Added URL to cache: {url}")
+                            
+                            if project_id and str(project_id) not in self.data['project_ids']:
+                                self.data['project_ids'].append(str(project_id))
+                                logging.debug(f"Added project ID to cache: {project_id}")
+                                
+                    except Exception as e:
+                        logging.warning(f"Error reading metadata from {metadata_file}: {e}")
+            
+            # Save updated cache
+            self.save()
+            logging.info(f"Cache rebuilt: {len(self.data['urls'])} URLs, {len(self.data['project_ids'])} project IDs")
+            
+        except Exception as e:
+            logging.error(f"Error rebuilding cache: {e}")
+    
     def save(self) -> None:
         """Save cache to file."""
         write_json(self.data, self.config.cache_file)
@@ -266,13 +309,13 @@ def retry_api_request(url: str, config: ScrapingConfig) -> APIResponse:
             break
         elif response.status_code == 429:
             logging.warning(f"Received 429 Too Many Requests for {url}. "
-                            f"Retrying in {config.request_delay} seconds...")
-            time.sleep(config.request_delay)
+                            f"Retrying in {config.retry_delay} seconds...")
+            time.sleep(config.retry_delay)
             continue
 
         # Retry on server errors or network issues
         if attempt < config.max_retries:
-            wait_time = config.retry_delay * (2 ** attempt)  # Exponential backoff
+            wait_time = config.request_delay * (2 ** attempt)  # Exponential backoff
             logging.warning(f"Request failed, retrying in {wait_time}s: {response.error}")
             time.sleep(wait_time)
     
@@ -291,7 +334,7 @@ def extract_project_data(html_content: str) -> Optional[Dict[str, Any]]:
         
         # Look for window.current_project
         for script in script_tags:
-            if script.string and 'window.current_project' in script.string:
+            if script.string and '  ' in script.string:
                 match = re.search(r'window\.current_project\s*=\s*"(.*?)";', script.string)
                 if match:
                     json_str = html.unescape(match.group(1)).replace('\\"', '"')
@@ -619,6 +662,10 @@ def scrape_kickstarter_projects(urls: List[str], config: Optional[ScrapingConfig
     
     # Setup cache and filter
     cache = Cache(config)
+    
+    # Rebuild cache from existing projects if needed
+    cache.rebuild_from_existing_projects()
+    
     new_urls = [url for url in valid_urls if not cache.is_processed(url)]
     cached_count = len(valid_urls) - len(new_urls)
     
@@ -711,19 +758,20 @@ if __name__ == "__main__":
         debug_mode=False,
         scrape_comments=True,
         scrape_updates=True,
-        max_retries=3
+        max_retries=5
     )
     
     # Example URLs
-    test_urls = [
-        "https://www.kickstarter.com/projects/ankermake/eufymake-e1-the-first-personal-3d-textured-uv-printer",
-        "https://www.kickstarter.com/projects/pixnlovegames/nightmare-busters-rebirth-0"
-    ]
+    # test_urls = [
+    #     "https://www.kickstarter.com/projects/ankermake/eufymake-e1-the-first-personal-3d-textured-uv-printer",
+    #     "https://www.kickstarter.com/projects/pixnlovegames/nightmare-busters-rebirth-0"
+    # ]
 
-    # final_df = pd.read_csv(r'/mnt/c/Users/giahu/OneDrive - Michigan State University/Projects/KickstarterRes/scraper/data/out/kickstarter_final_data_fixed.csv')
-    # project_urls = final_df['project_url'].tolist()
-    
-    
+    final_df = pd.read_csv(r'../data/out/kickstarter_final_data_fixed.csv')
+    project_urls = final_df['project_url'].tolist()
+    # reverse the list to process from the end
+    project_urls.reverse()
+
     # Run scraper
-    result = scrape_kickstarter_projects(test_urls, config)
+    result = scrape_kickstarter_projects(project_urls, config)
     print(f"Scraping completed: {result.successful}/{result.total_urls} successful")
